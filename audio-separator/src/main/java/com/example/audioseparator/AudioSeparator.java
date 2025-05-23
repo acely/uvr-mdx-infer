@@ -109,106 +109,181 @@ public class AudioSeparator implements AutoCloseable {
             segmentedMix.put(skip, segment); // Key is the original start of the chunk *without* margin
         }
         
-        float[][] vocals = processSegmentedMix(segmentedMix, totalOriginalSamples, currentProcessingChunkSize);
+        // processSegmentedMix now returns List<float[][][][]>
+        List<float[][][][]> fullSpectrograms = processSegmentedMix(segmentedMix, totalOriginalSamples, currentProcessingChunkSize);
+        float[][][][] fullVocalsSpectrogram = fullSpectrograms.get(0);
+        float[][][][] fullAccompanimentSpectrogram = fullSpectrograms.get(1);
 
-        float[][] noVocals = new float[numChannels][totalOriginalSamples];
-        for (int ch = 0; ch < numChannels; ++ch) {
-            for (int i = 0; i < totalOriginalSamples; ++i) {
-                noVocals[ch][i] = fullMixAudio[ch][i] - vocals[ch][i];
-            }
-        }
+        logger.info("Performing ISTFT on full vocals spectrogram...");
+        float[][] vocalsAudio = audioProcessor.istft(fullVocalsSpectrogram, totalOriginalSamples);
+        logger.info("Performing ISTFT on full accompaniment spectrogram...");
+        float[][] accompanimentAudio = audioProcessor.istft(fullAccompanimentSpectrogram, totalOriginalSamples);
         
+        // The task was to return vocals and *accompaniment*. 
+        // The original code calculated accompaniment as fullMixAudio - vocals.
+        // Now, accompaniment is directly synthesized from its own spectrogram.
+        // If the model is trained to output vocals and accompaniment directly, this is correct.
+        // If the model only outputs vocals, and accompaniment is derived, then the old logic for 'noVocals' would be needed *after* ISTFT of vocals.
+        // Assuming the model outputs a vocal component, and we derive accompaniment from it by subtraction from the mix in spectrogram domain,
+        // then ISTFTing both is the correct approach.
+
         List<float[][]> result = new ArrayList<>();
-        result.add(vocals);
-        result.add(noVocals);
+        result.add(vocalsAudio);
+        result.add(accompanimentAudio); // Now using the ISTFT of the accompaniment spectrogram
         logger.info("Audio separation process completed.");
         return result;
     }
 
-    private float[][] processSegmentedMix(Map<Long, float[][]> segmentedMix, int totalOriginalSamples, int processingChunkSize) {
-        logger.debug("Processing {} audio segments.", segmentedMix.size());
-        float[][] finalVocals = new float[2][totalOriginalSamples];
-        float[][] sumSquareWindow = new float[2][totalOriginalSamples]; // For weighted overlap-add
+    private List<float[][][][]> processSegmentedMix(Map<Long, float[][]> segmentedMix, int totalOriginalSamples, int processingChunkSize) {
+        logger.debug("Processing {} audio segments in spectrogram domain.", segmentedMix.size());
 
-        // Precompute a Hann window for overlap-add blending if margin > 0
-        float[] overlapAddWindow = (marginSamples > 0) ? audioProcessor.computeHannWindow(marginSamples * 2) : null;
+        final int n_fft = audioProcessor.getN_fft();
+        final int hop_length = audioProcessor.getHop_length();
+        final int dim_f = audioProcessor.getDim_f();
+        final int numChannels = 2; // Assuming stereo
+        final int numComplex = 2;  // Real and Imaginary
+
+        // Calculate total time frames for the full output spectrogram
+        // This should correspond to the STFT of totalOriginalSamples
+        final int totalTimeFrames = (totalOriginalSamples - n_fft) / hop_length + 1;
+        if (totalTimeFrames <= 0) {
+            logger.warn("Total time frames calculated to be {} based on totalOriginalSamples {}. Returning empty spectrograms.", totalTimeFrames, totalOriginalSamples);
+            List<float[][][][]> emptyResult = new ArrayList<>();
+            emptyResult.add(initializeSpectrogram(numChannels, numComplex, dim_f, 0));
+            emptyResult.add(initializeSpectrogram(numChannels, numComplex, dim_f, 0));
+            return emptyResult;
+        }
+
+
+        float[][][][] fullVocalsSpectrogram = initializeSpectrogram(numChannels, numComplex, dim_f, totalTimeFrames);
+        float[][][][] fullAccompSpectrogram = initializeSpectrogram(numChannels, numComplex, dim_f, totalTimeFrames);
+        float[] sumSquareWindow = new float[totalTimeFrames]; // 1D for frame-wise normalization factor
+
+        // Precompute a Hann window for overlap-add blending if marginSamples > 0
+        // The window length should cover the margin on one side.
+        // For overlap-add, a (symmetric) window of 2*marginFrames is often used, applied to each side of the overlap.
+        // Here, we'll use a Hann window of length (marginFrames * 2)
+        final int marginFrames = (marginSamples > 0) ? (marginSamples / hop_length) : 0;
+        float[] hannWindowForOverlap = (marginFrames > 0) ? audioProcessor.computeHannWindow(marginFrames * 2) : null;
 
         int segmentCount = segmentedMix.size();
         int currentSegmentNum = 0;
 
         for (Map.Entry<Long, float[][]> entry : segmentedMix.entrySet()) {
             currentSegmentNum++;
-            System.out.println("Processing segment " + currentSegmentNum + " of " + segmentCount + "...");
+            System.out.println("Processing segment " + currentSegmentNum + " of " + segmentCount + " (spectrogram domain)...");
 
-            long segmentOriginalStartSample = entry.getKey();
-            float[][] segmentWithMargin = entry.getValue();
+            long segmentOriginalStartSample = entry.getKey(); // Original start in samples, without left margin
+            float[][] segmentAudioWithMargin = entry.getValue(); // Audio data *including* margins
 
-            int originalLengthOfThisSegmentBeforeMargin = (int) Math.min(processingChunkSize, totalOriginalSamples - segmentOriginalStartSample);
+            // This is the length of the original audio segment *before* any margins were added for *this specific segment*.
+            int originalLengthOfThisSegmentAudio = (int) Math.min(processingChunkSize, totalOriginalSamples - segmentOriginalStartSample);
             
-            logger.debug("Processing segment starting at sample {}, original length before margin: {}, segment data length with margin: {}", 
-                segmentOriginalStartSample, originalLengthOfThisSegmentBeforeMargin, segmentWithMargin[0].length);
+            logger.debug("Processing segment: originalAudioStartSample={}, originalAudioLength={}, audioSegmentWithMarginLength={}", 
+                segmentOriginalStartSample, originalLengthOfThisSegmentAudio, segmentAudioWithMargin[0].length);
 
-            float[][] processedVocalsForSegmentWithMargin = demixChunk(segmentWithMargin); 
-
-            int copyFromStartInProcessed = (segmentOriginalStartSample == 0) ? 0 : this.marginSamples;
-            int copyToEndInProcessed = (segmentOriginalStartSample + originalLengthOfThisSegmentBeforeMargin >= totalOriginalSamples) ?
-                                       processedVocalsForSegmentWithMargin[0].length :
-                                       processedVocalsForSegmentWithMargin[0].length - this.marginSamples;
+            // demixChunk now returns List<float[][][][]> (vocals_spec, accomp_spec) for segmentAudioWithMargin
+            List<float[][][][]> segmentSpectrograms = demixChunk(segmentAudioWithMargin); 
+            float[][][][] vocalsSegmentSpec = segmentSpectrograms.get(0); // [2][2][dim_f][segment_frames]
+            float[][][][] accompSegmentSpec = segmentSpectrograms.get(1); // [2][2][dim_f][segment_frames]
             
-            int samplesToCopyFromThisSegment = copyToEndInProcessed - copyFromStartInProcessed;
+            int segmentTotalFrames = vocalsSegmentSpec[0][0][0].length; // Number of time frames in the current segment's spectrogram
 
-            int writeToStartInFinal = (int) segmentOriginalStartSample;
+            // Calculate frame indices for copying and overlap-add
+            // Start frame in the full spectrogram where this segment's content should begin
+            int writeToStartFrameFull = (int) (segmentOriginalStartSample / hop_length); 
+            
+            // Frame index in the segment's spectrogram from where we start copying (after left margin)
+            int readFromFrameInSegment = (segmentOriginalStartSample == 0) ? 0 : marginFrames;
 
-            if (samplesToCopyFromThisSegment <= 0) {
-                logger.warn("Segment at {} resulted in <=0 samples to copy. Skipping.", segmentOriginalStartSample);
+            // Number of frames in the segment's spectrogram that correspond to the original content (excluding margins)
+            // This is (originalLengthOfThisSegmentAudio - n_fft) / hop_length + 1, but segment spec is already for segmentAudioWithMargin
+            // So, we need to determine how many frames of the *processed* segment spec to actually use.
+            // The segmentSpectrograms from demixChunk are for `segmentAudioWithMargin`.
+            // We need to copy the part that corresponds to `originalLengthOfThisSegmentAudio`.
+
+            // Number of frames to copy from the processed segment spectrogram.
+            // This is the number of frames corresponding to originalLengthOfThisSegmentAudio.
+            int contentFramesInOriginalSegment = (originalLengthOfThisSegmentAudio - n_fft) / hop_length + 1;
+            if (originalLengthOfThisSegmentAudio < n_fft) contentFramesInOriginalSegment = 1; // Ensure at least 1 frame for short segments
+
+            // Effective frames to copy from the *middle* of segment spectrogram (after accounting for its internal margins)
+            int effectiveFramesToCopy = segmentTotalFrames - ((segmentOriginalStartSample == 0) ? 0 : marginFrames);
+            if (segmentOriginalStartSample + originalLengthOfThisSegmentAudio < totalOriginalSamples) {
+                 effectiveFramesToCopy -= marginFrames; // Subtract right margin if not the last overall segment
+            }
+            effectiveFramesToCopy = Math.max(0, effectiveFramesToCopy);
+
+
+            logger.debug("Segment {}: totalFramesInSegmentSpec={}, writeToStartFrameFull={}, readFromFrameInSegment={}, effectiveFramesToCopy={}",
+                         currentSegmentNum, segmentTotalFrames, writeToStartFrameFull, readFromFrameInSegment, effectiveFramesToCopy);
+            
+            if (effectiveFramesToCopy <= 0) {
+                logger.warn("Segment {} resulted in <=0 effective frames to copy. Skipping.", currentSegmentNum);
                 continue;
             }
-            if (writeToStartInFinal + samplesToCopyFromThisSegment > totalOriginalSamples) {
-                samplesToCopyFromThisSegment = totalOriginalSamples - writeToStartInFinal; // Trim if it overruns
-            }
 
+            // Apply overlap-add to the spectrograms
+            for (int t_seg = 0; t_seg < effectiveFramesToCopy; ++t_seg) {
+                int t_full = writeToStartFrameFull + t_seg; // Frame index in the full spectrogram
+                int t_read = readFromFrameInSegment + t_seg; // Frame index in the current segment's spectrogram
 
-            for (int ch = 0; ch < 2; ++ch) {
-                for (int i = 0; i < samplesToCopyFromThisSegment; ++i) {
-                    int readIdx = copyFromStartInProcessed + i;
-                    int writeIdx = writeToStartInFinal + i;
-
-                    float windowVal = 1.0f;
-                    if (overlapAddWindow != null) {
-                        // Determine if we are in a left or right margin overlap region
-                        if (i < marginSamples && segmentOriginalStartSample != 0) { // Left overlap (not first chunk)
-                            windowVal = overlapAddWindow[i];
-                        } else if (i >= originalLengthOfThisSegmentBeforeMargin - marginSamples && 
-                                   (segmentOriginalStartSample + originalLengthOfThisSegmentBeforeMargin) < totalOriginalSamples) { // Right overlap (not last part of audio)
-                             // Index into the second half of the Hann window
-                            windowVal = overlapAddWindow[marginSamples + (i - (originalLengthOfThisSegmentBeforeMargin - marginSamples))];
-                        }
-                        // If not in overlap, windowVal remains 1.0 implicitly for the center part
-                        // or if it's the very start/end of the whole audio.
-                    }
-                    
-                    finalVocals[ch][writeIdx] += processedVocalsForSegmentWithMargin[ch][readIdx] * windowVal;
-                    sumSquareWindow[ch][writeIdx] += windowVal * windowVal;
+                if (t_full >= totalTimeFrames || t_read >= segmentTotalFrames) {
+                    logger.warn("Frame index out of bounds. t_full={}, totalTimeFrames={}, t_read={}, segmentTotalFrames={}", 
+                                t_full, totalTimeFrames, t_read, segmentTotalFrames);
+                    continue; 
                 }
+
+                float windowVal = 1.0f;
+                if (hannWindowForOverlap != null) {
+                    // Determine if we are in a left or right margin overlap region FOR THIS SEGMENT
+                    boolean isLeftMargin = (segmentOriginalStartSample != 0 && t_seg < marginFrames);
+                    boolean isRightMargin = ( (segmentOriginalStartSample + originalLengthOfThisSegmentAudio < totalOriginalSamples) && 
+                                             (t_seg >= effectiveFramesToCopy - marginFrames) );
+                    
+                    if (isLeftMargin) {
+                        windowVal = hannWindowForOverlap[t_seg]; // First half of Hann window
+                    } else if (isRightMargin) {
+                        // Index into the second half of the Hann window
+                        windowVal = hannWindowForOverlap[marginFrames + (t_seg - (effectiveFramesToCopy - marginFrames))];
+                    }
+                }
+
+                for (int ch = 0; ch < numChannels; ++ch) {
+                    for (int cpl = 0; cpl < numComplex; ++cpl) {
+                        for (int f = 0; f < dim_f; ++f) {
+                            fullVocalsSpectrogram[ch][cpl][f][t_full] += vocalsSegmentSpec[ch][cpl][f][t_read] * windowVal;
+                            fullAccompSpectrogram[ch][cpl][f][t_full] += accompanimentSegmentSpec[ch][cpl][f][t_read] * windowVal;
+                        }
+                    }
+                }
+                sumSquareWindow[t_full] += windowVal * windowVal;
             }
-            logger.debug("Applied segment (orig_start: {}) to finalVocals. Copied {} samples from processed (start_idx: {}) to final (start_idx: {}).",
-                segmentOriginalStartSample, samplesToCopyFromThisSegment, copyFromStartInProcessed, writeToStartInFinal);
-            
-            System.out.println("Segment " + currentSegmentNum + " processed.");
+             System.out.println("Segment " + currentSegmentNum + " processed (spectrogram domain).");
         }
 
         // Normalize the overlap-added regions
-        for (int ch = 0; ch < 2; ++ch) {
-            for (int i = 0; i < totalOriginalSamples; ++i) {
-                if (sumSquareWindow[ch][i] > 1e-8f) { // Avoid division by zero or very small numbers
-                    finalVocals[ch][i] /= sumSquareWindow[ch][i];
+        for (int t = 0; t < totalTimeFrames; ++t) {
+            if (sumSquareWindow[t] > 1e-8f) {
+                for (int ch = 0; ch < numChannels; ++ch) {
+                    for (int cpl = 0; cpl < numComplex; ++cpl) {
+                        for (int f = 0; f < dim_f; ++f) {
+                            fullVocalsSpectrogram[ch][cpl][f][t] /= sumSquareWindow[t];
+                            fullAccompSpectrogram[ch][cpl][f][t] /= sumSquareWindow[t];
+                        }
+                    }
                 }
             }
         }
-        return finalVocals;
+        
+        List<float[][][][]> resultSpectrograms = new ArrayList<>();
+        resultSpectrograms.add(fullVocalsSpectrogram);
+        resultSpectrograms.add(fullAccompSpectrogram);
+        return resultSpectrograms;
     }
     
-    private float[][] demixChunk(float[][] segmentWithMargin) {
+    // Returns a list containing two spectrograms: 0 = vocals, 1 = accompaniment
+    private List<float[][][][]> demixChunk(float[][] segmentWithMargin) { // Signature already changed
         final int n_fft = audioProcessor.getN_fft();
         final int hop_length = audioProcessor.getHop_length();
         final int dim_t_model = audioProcessor.getDim_t();
@@ -237,10 +312,12 @@ public class AudioSeparator implements AutoCloseable {
         for(int ch=0; ch<2; ++ch) {
             System.arraycopy(segmentWithMargin[ch], 0, fullyPaddedSegment[ch], stftInternalTrim, currentSamplesInSegment);
         }
-        logger.debug("DemixChunk: segment_len={}, pythonGenSize={}, padForGenSize={}, loop_input_len={}, model_proc_chunk_size={}", 
+        logger.debug("DemixChunk: segment_len={}, pythonGenSize={}, padForPythonGenSize={}, loop_input_len={}, model_proc_chunk_size={}",
             currentSamplesInSegment, pythonGenSize, padForPythonGenSize, paddedInputLengthForLoop, stftModelProcessingChunkSize);
 
-        List<float[][]> processedSubChunksAudio = new ArrayList<>();
+        List<float[][][][]> vocalSubChunkSpectrograms = new ArrayList<>();
+        List<float[][][][]> accompanimentSubChunkSpectrograms = new ArrayList<>();
+        int totalFramesProcessed = 0;
 
         for (int i = 0; i <= paddedInputLengthForLoop - stftModelProcessingChunkSize; i += pythonGenSize) {
             float[][] subChunkForStft = new float[2][stftModelProcessingChunkSize];
@@ -275,31 +352,158 @@ public class AudioSeparator implements AutoCloseable {
                 inputTensor.close();
             }
 
-            float[][][][] istftInputSpectrogram = modelOutputToIstftInput(resultSpec, dim_f_model, dim_t_model);
-            float[][] processedSubChunkAudio = audioProcessor.istft(istftInputSpectrogram, stftModelProcessingChunkSize);
+            // resultSpec is the model's direct output for vocals (after potential denoising)
+            // its shape is [1][4][dim_f_model][dim_t_model]
+            // We need to convert it to [2][2][dim_f_model][dim_t_model] for consistency
+            float[][][][] vocalSubChunkSpec = modelOutputToIstftInput(resultSpec, dim_f_model, dim_t_model);
+            
+            // mix_sub_chunk_spectrogram (named 'spectrogram' earlier in the loop)
+            // also needs to be [2][2][dim_f_model][dim_t_model]
+            // The stft method already returns this format.
+            float[][][][] mixSubChunkSpec = spectrogram; // This is the STFT of the current subChunkForStft
 
-            float[][] trimmedSubChunk = new float[2][pythonGenSize];
-            for (int ch = 0; ch < 2; ++ch) {
-                 System.arraycopy(processedSubChunkAudio[ch], stftInternalTrim, trimmedSubChunk[ch], 0, pythonGenSize);
-            }
-            processedSubChunksAudio.add(trimmedSubChunk);
+            float[][][][] accompanimentSubChunkSpec = subtractSpectrograms(mixSubChunkSpec, vocalSubChunkSpec);
+
+            vocalSubChunkSpectrograms.add(vocalSubChunkSpec);
+            accompanimentSubChunkSpectrograms.add(accompanimentSubChunkSpec);
+            totalFramesProcessed += dim_t_model; // Each sub-chunk spec has dim_t_model frames
         }
         
-        float[][] concatenatedAudio = new float[2][currentSamplesInSegment];
-        int currentWritePos = 0;
-        for (float[][] subChunk : processedSubChunksAudio) {
-            int lengthToCopy = Math.min(subChunk[0].length, currentSamplesInSegment - currentWritePos);
-            if (lengthToCopy <= 0) break;
-            for (int ch = 0; ch < 2; ++ch) {
-                System.arraycopy(subChunk[ch], 0, concatenatedAudio[ch], currentWritePos, lengthToCopy);
-            }
-            currentWritePos += lengthToCopy;
+        logger.debug("Processed {} sub-chunks. Concatenating spectrograms.", vocalSubChunkSpectrograms.size());
+
+        // Concatenate sub-chunk spectrograms
+        // The effective number of frames in each sub-chunk after ISTFT and trimming would be (pythonGenSize / hop_length)
+        // However, the spectrograms themselves (before ISTFT) have dim_t_model frames.
+        // The concatenation logic in python for audio is:
+        //   waves = [self.istft(s) for s in self.stft_secondary_outputs]
+        //   waves = [wave[:, :, self.trim:-self.trim] for wave in waves]
+        //   res = np.concatenate(waves, axis=-1)[:, :, :mix_waves_length]
+        // This means each sub-chunk spectrogram contributes (pythonGenSize / hop_length) frames to the final *time-domain* signal.
+        // For spectrogram domain concatenation, we need to be careful.
+        // Each sub-chunk spec is dim_t_model long. The step was pythonGenSize.
+        // Let's assume for now that we are concatenating the full dim_t_model frames from each spec,
+        // and then trimming at the very end based on currentSamplesInSegment.
+        
+        int expectedTotalFrames = (currentSamplesInSegment + padForPythonGenSize) / hop_length + 1; 
+        // This is an estimate; more accurately, it's (padded_input_length_for_loop - n_fft)/hop_length + 1,
+        // if we consider the signal that was actually looped over for STFTs.
+        // Or, simpler: sum of (dim_t_model - 2 * (stftInternalTrim / hop_length)) if overlap-add was done in spec domain.
+        // Given the python code concatenates in time domain *after* ISTFT and trimming each sub-chunk,
+        // we should replicate that by trimming each sub-chunk spectrogram before concatenating.
+        // Each sub-chunk spec (dim_t_model frames) corresponds to stftModelProcessingChunkSize audio samples.
+        // After ISTFT and trimming stftInternalTrim, it becomes pythonGenSize audio samples.
+        // Number of frames for pythonGenSize: (pythonGenSize - n_fft) / hop_length + 1 IF n_fft is subtracted.
+        // But STFT output is already for the full stftModelProcessingChunkSize.
+        // The effective non-overlapping part of each spec is pythonGenSize worth of audio.
+        // Number of frames corresponding to pythonGenSize: pythonGenSize / hop_length (if pythonGenSize is multiple of hop_length)
+        
+        // Let's adjust the sub-chunk spectrograms to represent the "trimmed" audio part (pythonGenSize)
+        // Number of frames for stftInternalTrim: stftInternalTrim / hop_length
+        int framesToTrimFromSubChunkSpec = stftInternalTrim / hop_length;
+        List<float[][][][]> trimmedVocalSpecs = new ArrayList<>();
+        List<float[][][][]> trimmedAccompSpecs = new ArrayList<>();
+
+        for(float[][][][] spec : vocalSubChunkSpectrograms) {
+            trimmedVocalSpecs.add(trimSpectrogramFrames(spec, framesToTrimFromSubChunkSpec, framesToTrimFromSubChunkSpec));
         }
-        logger.debug("Demixing chunk finished. Output length: {}", concatenatedAudio[0].length);
-        return concatenatedAudio;
+        for(float[][][][] spec : accompanimentSubChunkSpectrograms) {
+            trimmedAccompSpecs.add(trimSpectrogramFrames(spec, framesToTrimFromSubChunkSpec, framesToTrimFromSubChunkSpec));
+        }
+
+        float[][][][] fullVocalsSpectrogram = concatenateSpectrograms(trimmedVocalSpecs, dim_f_model);
+        float[][][][] fullAccompSpectrogram = concatenateSpectrograms(trimmedAccompSpecs, dim_f_model);
+
+        // Final trim based on `padForPythonGenSize` (padding added to make original segment multiple of pythonGenSize)
+        int totalFramesBeforeFinalTrim = fullVocalsSpectrogram[0][0][0].length;
+        int framesToTrimEnd = (padForPythonGenSize > 0) ? (padForPythonGenSize / hop_length) : 0;
+        // This might not be perfectly accurate if padForPythonGenSize is not a multiple of hop_length.
+        // The python code trims in time domain: `[:, :, :mix_waves_length]`.
+        // So, the target number of frames is roughly `currentSamplesInSegment / hop_length`.
+        int targetTotalFrames = (currentSamplesInSegment - n_fft) / hop_length + 1;
+
+
+        fullVocalsSpectrogram = trimSpectrogramFrames(fullVocalsSpectrogram, 0, totalFramesBeforeFinalTrim - targetTotalFrames);
+        fullAccompSpectrogram = trimSpectrogramFrames(fullAccompSpectrogram, 0, totalFramesBeforeFinalTrim - targetTotalFrames);
+        
+        logger.debug("Demixing chunk finished. Spectrograms ready. Target frames: {}, Actual frames: {}", targetTotalFrames, fullVocalsSpectrogram[0][0][0].length);
+        
+        List<float[][][][]> resultSpectrograms = new ArrayList<>();
+        resultSpectrograms.add(fullVocalsSpectrogram);
+        resultSpectrograms.add(fullAccompSpectrogram);
+        return resultSpectrograms;
     }
 
-    private float[][][][] spectrogramToArrayForModel(float[][][][] spec, int dim_f, int dim_t) {
+    private float[][][][] subtractSpectrograms(float[][][][] spec1, float[][][][] spec2) {
+        // Assumes spec1 and spec2 have the same dimensions [2][2][dim_f][dim_t]
+        int numChannels = spec1.length; // Should be 2 (L, R)
+        int numComplex = spec1[0].length; // Should be 2 (Real, Imag)
+        int dim_f = spec1[0][0].length;
+        int dim_t = spec1[0][0][0].length;
+
+        float[][][][] result = new float[numChannels][numComplex][dim_f][dim_t];
+
+        for (int ch = 0; ch < numChannels; ch++) {
+            for (int cpl = 0; cpl < numComplex; cpl++) {
+                for (int f = 0; f < dim_f; f++) {
+                    for (int t = 0; t < dim_t; t++) {
+                        result[ch][cpl][f][t] = spec1[ch][cpl][f][t] - spec2[ch][cpl][f][t];
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    private float[][][][] concatenateSpectrograms(List<float[][][][]> subChunkSpectrograms, int dim_f) {
+        if (subChunkSpectrograms.isEmpty()) {
+            return new float[2][2][dim_f][0]; // Return empty spectrogram if list is empty
+        }
+        // Calculate total time frames
+        int total_dim_t = 0;
+        for (float[][][][] spec : subChunkSpectrograms) {
+            total_dim_t += spec[0][0][0].length;
+        }
+
+        float[][][][] concatenated = new float[2][2][dim_f][total_dim_t];
+        int currentTimeFrameOffset = 0;
+        for (float[][][][] spec : subChunkSpectrograms) {
+            int currentSpecDimT = spec[0][0][0].length;
+            for (int ch = 0; ch < 2; ch++) {
+                for (int cpl = 0; cpl < 2; cpl++) {
+                    for (int f = 0; f < dim_f; f++) {
+                        System.arraycopy(spec[ch][cpl][f], 0, concatenated[ch][cpl][f], currentTimeFrameOffset, currentSpecDimT);
+                    }
+                }
+            }
+            currentTimeFrameOffset += currentSpecDimT;
+        }
+        return concatenated;
+    }
+
+    private float[][][][] trimSpectrogramFrames(float[][][][] spectrogram, int framesToTrimStart, int framesToTrimEnd) {
+        int numChannels = spectrogram.length;
+        int numComplex = spectrogram[0].length;
+        int dim_f = spectrogram[0][0].length;
+        int original_dim_t = spectrogram[0][0][0].length;
+
+        int new_dim_t = original_dim_t - framesToTrimStart - framesToTrimEnd;
+        if (new_dim_t <= 0) {
+            logger.warn("Spectrogram trimming results in non-positive time frames ({}). Returning empty or original.", new_dim_t);
+            return (new_dim_t == 0) ? new float[numChannels][numComplex][dim_f][0] : spectrogram; // Or throw error
+        }
+
+        float[][][][] trimmed = new float[numChannels][numComplex][dim_f][new_dim_t];
+        for (int ch = 0; ch < numChannels; ch++) {
+            for (int cpl = 0; cpl < numComplex; cpl++) {
+                for (int f = 0; f < dim_f; f++) {
+                    System.arraycopy(spectrogram[ch][cpl][f], framesToTrimStart, trimmed[ch][cpl][f], 0, new_dim_t);
+                }
+            }
+        }
+        return trimmed;
+    }
+    
+    private float[][][][] spectrogramToArrayForModel(float[][][][] spec, int dim_f, int dim_t) { // Unchanged
         // Input: [2][2][dim_f][dim_t] (ch, real/imag, freq, time)
         // Output: [1][4][dim_f][dim_t] (batch, LRe,LIm,RRe,RIm, freq, time)
         float[][][][] modelInput = new float[1][4][dim_f][dim_t];
@@ -314,7 +518,7 @@ public class AudioSeparator implements AutoCloseable {
         return modelInput;
     }
     
-    private float[][][][] negateSpectrogram(float[][][][] spec) {
+    private float[][][][] negateSpectrogram(float[][][][] spec) { // Unchanged
         float[][][][] negated = new float[spec.length][spec[0].length][spec[0][0].length][spec[0][0][0].length];
         for(int i=0; i<spec.length; ++i) for(int j=0; j<spec[0].length; ++j) for(int k=0; k<spec[0][0].length; ++k) for(int l=0; l<spec[0][0][0].length; ++l) {
             negated[i][j][k][l] = -spec[i][j][k][l];
@@ -323,7 +527,7 @@ public class AudioSeparator implements AutoCloseable {
     }
 
 
-    private OnnxTensor spectrogramToOnnxTensor(float[][][][] spec, int dim_f, int dim_t) {
+    private OnnxTensor spectrogramToOnnxTensor(float[][][][] spec, int dim_f, int dim_t) { // Unchanged
         // Input: [2][2][dim_f][dim_t] (ch, real/imag, freq, time)
         // Output: ONNXTensor for [1][4][dim_f][dim_t]
         float[][][][] modelInputArray = spectrogramToArrayForModel(spec, dim_f, dim_t);
@@ -351,7 +555,7 @@ public class AudioSeparator implements AutoCloseable {
     }
 
 
-    private float[] flatten4DArray(float[][][][] array) {
+    private float[] flatten4DArray(float[][][][] array) { // Unchanged
         int d1 = array.length;
         int d2 = array[0].length;
         int d3 = array[0][0].length;
@@ -369,11 +573,11 @@ public class AudioSeparator implements AutoCloseable {
         return flat;
     }
     
-    private OnnxTensor floatBufferToOnnxTensor(FloatBuffer buffer, long[] shape) throws OrtException {
+    private OnnxTensor floatBufferToOnnxTensor(FloatBuffer buffer, long[] shape) throws OrtException { // Unchanged
         return OnnxTensor.createTensor(this.env, buffer, shape);
     }
 
-    private float[][][][] onnxValueTo4DSpec(OnnxValue onnxValue, int dim_f, int dim_t) throws OrtException {
+    private float[][][][] onnxValueTo4DSpec(OnnxValue onnxValue, int dim_f, int dim_t) throws OrtException { // Unchanged
         // Expected shape [1][4][dim_f][dim_t]
         float[][][][] result = new float[1][4][dim_f][dim_t];
         if (onnxValue instanceof OnnxTensor) {
@@ -394,6 +598,10 @@ public class AudioSeparator implements AutoCloseable {
             throw new IllegalArgumentException("OnnxValue is not an OnnxTensor.");
         }
         return result;
+    }
+
+    private float[][][][] initializeSpectrogram(int channels, int complex, int freqBins, int timeFrames) {
+        return new float[channels][complex][freqBins][timeFrames];
     }
 
     @Override

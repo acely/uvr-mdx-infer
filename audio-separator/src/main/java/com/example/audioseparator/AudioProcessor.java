@@ -123,24 +123,38 @@ public class AudioProcessor {
         int numFreqBinsInSpectrogram = spectrogram[0][0].length; // Should be dim_f
         int numFramesInSpectrogram = spectrogram[0][0][0].length; // Should be dim_t
 
-        if (numFreqBinsInSpectrogram != dim_f || numFramesInSpectrogram != dim_t) {
-            logger.warn("Spectrogram dimensions [{},{},{},{}] do not match configured dim_f={} and dim_t={}",
-                    numChannels, 2, numFreqBinsInSpectrogram, numFramesInSpectrogram, dim_f, dim_t);
-            // Potentially throw an error or try to adapt, but for now, assume they match.
+        if (numFreqBinsInSpectrogram != this.dim_f) { // Check against this.dim_f as it's a property of the processor
+            logger.warn("Spectrogram frequency bin count {} does not match configured dim_f={}. Results may be unexpected.",
+                    numFreqBinsInSpectrogram, this.dim_f);
+            // Continue processing, but reconstruction will use this.dim_f for packing FFT frame.
+        }
+        if (numFramesInSpectrogram == 0 && originalChunkLength == 0) {
+             logger.warn("Input spectrogram has 0 frames and originalChunkLength is 0. Returning empty audio.");
+             return new float[numChannels][0];
+        }
+        if (numFramesInSpectrogram == 0 && originalChunkLength > 0) {
+            logger.warn("Input spectrogram has 0 frames, but originalChunkLength is {}. Returning silence.", originalChunkLength);
+            return new float[numChannels][originalChunkLength]; // Already zero-filled
         }
 
+
         float[][] outputAudio = new float[numChannels][originalChunkLength];
-        // Total length of the signal after overlap-add, before trimming padding
-        int synthesizedSignalLength = (dim_t - 1) * hop_length + n_fft;
+        // Calculate synthesizedSignalLength based on the actual number of frames in the input spectrogram
+        int synthesizedSignalLength = (numFramesInSpectrogram - 1) * hop_length + n_fft;
+        if (synthesizedSignalLength <= 0) { // Should not happen if numFramesInSpectrogram > 0
+            logger.warn("Calculated synthesizedSignalLength is {}. Output will be silent or truncated.", synthesizedSignalLength);
+            // Return empty or zero-filled array matching originalChunkLength
+            return new float[numChannels][originalChunkLength];
+        }
 
 
         for (int channelIdx = 0; channelIdx < numChannels; channelIdx++) {
             float[] currentChannelFull = new float[synthesizedSignalLength];
             float[] packedFftFrame = new float[n_fft]; // JTransforms works in-place
 
-            for (int t = 0; t < dim_t; t++) {
-                // Reconstruct packed FFT frame from spectrogram data (real and imag parts)
-                // And pad with zeros if dim_f < n_fft/2 + 1
+            // Loop over all frames in the input spectrogram
+            for (int t = 0; t < numFramesInSpectrogram; t++) {
+                // Reconstruct packed FFT frame from spectrogram data
                 packedFftFrame[0] = spectrogram[channelIdx][0][0][t]; // DC real
                 // Imaginary part of DC is 0, not explicitly set as realInverse expects it.
 
@@ -178,21 +192,17 @@ public class AudioProcessor {
             // Trim the padding
             int startIndex = stftPadding; // n_fft / 2
             // The length of the signal segment that corresponds to the originalChunkLength before padding
-            int effectiveSignalLength = (dim_t - 1) * hop_length;
+            // This 'effectiveSignalLength' was based on this.dim_t, which is no longer relevant for full track ISTFT.
+            // The relevant length is simply originalChunkLength.
+            // The synthesizedSignalLength is already calculated based on numFramesInSpectrogram.
 
-            int lengthToCopy = originalChunkLength;
-            if (originalChunkLength > effectiveSignalLength) {
-                // This case means the originalChunkLength was longer than what this STFT/ISTFT process naturally produces without its own padding.
-                // This shouldn't happen if originalChunkLength is derived from the input to STFT.
-                // We can only reconstruct up to effectiveSignalLength from the spectrogram.
-                logger.warn("originalChunkLength {} is greater than the effective signal length {} reconstructable from the spectrogram. Output will be truncated to {}.",
-                            originalChunkLength, effectiveSignalLength, effectiveSignalLength);
-                lengthToCopy = effectiveSignalLength;
-            }
+            int lengthToCopy = originalChunkLength; 
             
             // Ensure we don't try to copy more than available in currentChannelFull (after removing padding)
             // or more than fits into outputAudio[channelIdx]
-            int availableAfterTrim = synthesizedSignalLength - 2 * stftPadding;
+            int availableAfterTrim = synthesizedSignalLength - (2 * stftPadding); // Total samples after removing STFT padding
+            if (availableAfterTrim < 0) availableAfterTrim = 0;
+
             lengthToCopy = Math.min(lengthToCopy, availableAfterTrim);
             lengthToCopy = Math.min(lengthToCopy, outputAudio[channelIdx].length);
 
