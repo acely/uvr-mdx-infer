@@ -133,8 +133,13 @@ public class AudioSeparator implements AutoCloseable {
         // Precompute a Hann window for overlap-add blending if margin > 0
         float[] overlapAddWindow = (marginSamples > 0) ? audioProcessor.computeHannWindow(marginSamples * 2) : null;
 
+        int segmentCount = segmentedMix.size();
+        int currentSegmentNum = 0;
 
         for (Map.Entry<Long, float[][]> entry : segmentedMix.entrySet()) {
+            currentSegmentNum++;
+            System.out.println("Processing segment " + currentSegmentNum + " of " + segmentCount + "...");
+
             long segmentOriginalStartSample = entry.getKey();
             float[][] segmentWithMargin = entry.getValue();
 
@@ -188,6 +193,8 @@ public class AudioSeparator implements AutoCloseable {
             }
             logger.debug("Applied segment (orig_start: {}) to finalVocals. Copied {} samples from processed (start_idx: {}) to final (start_idx: {}).",
                 segmentOriginalStartSample, samplesToCopyFromThisSegment, copyFromStartInProcessed, writeToStartInFinal);
+            
+            System.out.println("Segment " + currentSegmentNum + " processed.");
         }
 
         // Normalize the overlap-added regions
