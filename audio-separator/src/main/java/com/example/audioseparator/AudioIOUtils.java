@@ -217,4 +217,86 @@ public class AudioIOUtils {
             logger.error("Error writing WAV file: {} - {}", filePath, e.getMessage(), e);
         }
     }
+
+    /**
+     * Reads a raw PCM file with 32-bit floating-point, little-endian samples.
+     *
+     * @param filePath Path to the raw PCM file.
+     * @param sampleRate The sample rate of the audio (for metadata, not used in decoding itself).
+     * @param numChannels Number of channels in the audio (e.g., 1 for mono, 2 for stereo).
+     * @return A float[][] array where float[channel][sampleIndex] stores the audio data, range -1.0 to 1.0.
+     * @throws IOException If an I/O error occurs or the file format is inconsistent.
+     * @throws IllegalArgumentException If numChannels is not positive.
+     */
+    public static float[][] readRawPcmF32LE(String filePath, float sampleRate, int numChannels) throws IOException {
+        logger.info("Reading raw PCM F32LE file: {}, sampleRate: {}, numChannels: {}", filePath, sampleRate, numChannels);
+
+        if (numChannels <= 0) {
+            throw new IllegalArgumentException("Number of channels must be positive. Got: " + numChannels);
+        }
+
+        File file = new File(filePath);
+        if (!file.exists()) {
+            throw new java.io.FileNotFoundException("File not found: " + filePath);
+        }
+
+        long fileSize = file.length();
+        if (fileSize > Integer.MAX_VALUE) { // ByteBuffer.wrap takes an int for length
+            throw new IOException("File is too large to process in a single byte array: " + fileSize + " bytes.");
+        }
+        if (fileSize == 0) {
+            logger.warn("File is empty: {}", filePath);
+            return new float[numChannels][0];
+        }
+
+        final int bytesPerSampleFloat = 4; // 32-bit float
+        final int frameSizeInBytes = bytesPerSampleFloat * numChannels;
+
+        if (fileSize % frameSizeInBytes != 0) {
+            logger.warn("File size {} is not perfectly divisible by ({} bytesPerSampleFloat * {} numChannels = {} bytesPerFrame). Possible truncation or malformed file.",
+                        fileSize, bytesPerSampleFloat, numChannels, frameSizeInBytes);
+            // Decide if this should be an error or a warning. For now, proceed but it might lead to issues.
+        }
+
+        byte[] allBytes = new byte[(int) fileSize];
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(file);
+             java.io.BufferedInputStream bis = new java.io.BufferedInputStream(fis)) {
+            int totalBytesRead = 0;
+            int bytesReadThisTurn;
+            while (totalBytesRead < fileSize && (bytesReadThisTurn = bis.read(allBytes, totalBytesRead, (int)fileSize - totalBytesRead)) != -1) {
+                totalBytesRead += bytesReadThisTurn;
+            }
+            if (totalBytesRead != fileSize) {
+                throw new IOException("Could not read the entire file. Expected " + fileSize + " bytes, got " + totalBytesRead);
+            }
+        }
+
+        int numTotalFloats = allBytes.length / bytesPerSampleFloat;
+        int numSamplesPerChannel = numTotalFloats / numChannels;
+
+        if (numSamplesPerChannel == 0 && numTotalFloats > 0) {
+             logger.warn("Calculated zero samples per channel, but file has {} bytes. Check numChannels ({}) parameter.", fileSize, numChannels);
+        }
+
+
+        float[][] audioData = new float[numChannels][numSamplesPerChannel];
+        ByteBuffer byteBuffer = ByteBuffer.wrap(allBytes);
+        byteBuffer.order(ByteOrder.LITTLE_ENDIAN);
+
+        for (int s = 0; s < numSamplesPerChannel; s++) {
+            for (int c = 0; c < numChannels; c++) {
+                // Check if buffer has enough remaining bytes before calling getFloat()
+                if (byteBuffer.remaining() >= bytesPerSampleFloat) {
+                    audioData[c][s] = byteBuffer.getFloat();
+                } else {
+                    // This should ideally not happen if fileSize % frameSizeInBytes == 0 and calculations are correct
+                    logger.error("Unexpected end of byte buffer while reading sample s={}, channel c={}. File size: {}, numChannels: {}", s, c, fileSize, numChannels);
+                    // Fill remaining with 0 or throw error
+                    audioData[c][s] = 0.0f; 
+                }
+            }
+        }
+        logger.info("Successfully read {} samples per channel from raw PCM file: {}", numSamplesPerChannel, filePath);
+        return audioData;
+    }
 }
