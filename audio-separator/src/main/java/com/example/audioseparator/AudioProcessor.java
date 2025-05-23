@@ -150,6 +150,7 @@ public class AudioProcessor {
 
         for (int channelIdx = 0; channelIdx < numChannels; channelIdx++) {
             float[] currentChannelFull = new float[synthesizedSignalLength];
+            float[] sumOfWindows = new float[synthesizedSignalLength]; // For OLA normalization
             float[] packedFftFrame = new float[n_fft]; // JTransforms works in-place
 
             // Loop over all frames in the input spectrogram
@@ -184,8 +185,18 @@ public class AudioProcessor {
                 int frameStartOutput = t * hop_length;
                 for (int i = 0; i < n_fft; i++) {
                     if (frameStartOutput + i < synthesizedSignalLength) {
-                        currentChannelFull[frameStartOutput + i] += packedFftFrame[i];
+                        currentChannelFull[frameStartOutput + i] += packedFftFrame[i]; // packedFftFrame is already windowed by applyWindow()
+                        sumOfWindows[frameStartOutput + i] += hannWindow[i]; // Accumulate the synthesis window value
                     }
+                }
+            }
+
+            // Normalize the synthesized signal
+            for (int i = 0; i < synthesizedSignalLength; i++) {
+                if (Math.abs(sumOfWindows[i]) > 1e-6f) {
+                    currentChannelFull[i] /= sumOfWindows[i];
+                } else {
+                    currentChannelFull[i] = 0.0f; // If sum of windows is near zero, set signal to zero
                 }
             }
 
