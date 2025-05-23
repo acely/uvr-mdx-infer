@@ -32,7 +32,7 @@ public class Main {
         options.addOption("F", "n_fft", true, "N_FFT size (default: 6144)");
         options.addOption("T", "dim_t_exponent", true, "Exponent for STFT time frames (dim_t = 2^exponent) (default: 8 -> 256 frames)");
         options.addOption("f", "dim_f", true, "Dimension F for STFT frequency bins (default: 2048)");
-        options.addOption("r", "sample_rate", true, "Target sample rate for processing (default: 44100.0f)");
+        // options.addOption("r", "sample_rate", true, "Target sample rate for processing (default: 44100.0f)"); // Removed
         options.addOption("h", "help", false, "Display this help message");
 
         CommandLineParser parser = new DefaultParser();
@@ -75,9 +75,10 @@ public class Main {
         processingArgs.put("model_path", cmd.getOptionValue("m"));
         // Denoising is true by default in original python script, so "no-denoise" flag means set denoiseEnabled to false
         processingArgs.put("denoise", !cmd.hasOption("d")); 
-        float targetSampleRate = Float.parseFloat(cmd.getOptionValue("sample_rate", "44100.0"));
-        processingArgs.put("sample_rate", targetSampleRate);
-        processingArgs.put("margin", Integer.parseInt(cmd.getOptionValue("margin_samples", String.valueOf((int)targetSampleRate)))); // Default 1s margin
+        float targetSampleRate = 44100.0f; // Hardcoded sample rate
+        processingArgs.put("sample_rate", targetSampleRate); // Hardcoded for AudioSeparator
+        // Default margin is 1s * 44100 = 44100 samples
+        processingArgs.put("margin", Integer.parseInt(cmd.getOptionValue("margin_samples", "44100"))); 
         processingArgs.put("chunks", Integer.parseInt(cmd.getOptionValue("chunk_seconds", "45")));
 
 
