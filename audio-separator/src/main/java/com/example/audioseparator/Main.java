@@ -33,6 +33,7 @@ public class Main {
         options.addOption("T", "dim_t_exponent", true, "Exponent for STFT time frames (dim_t = 2^exponent) (default: 8 -> 256 frames)");
         options.addOption("f", "dim_f", true, "Dimension F for STFT frequency bins (default: 2048)");
         // options.addOption("r", "sample_rate", true, "Target sample rate for processing (default: 44100.0f)"); // Removed
+        options.addOption(null, "output_content", true, "Specify output content: 'vocals' or 'both'. Default: 'both'");
         options.addOption("h", "help", false, "Display this help message");
 
         CommandLineParser parser = new DefaultParser();
@@ -80,6 +81,13 @@ public class Main {
         // Default margin is 1s * 44100 = 44100 samples
         processingArgs.put("margin", Integer.parseInt(cmd.getOptionValue("margin_samples", "44100"))); 
         processingArgs.put("chunks", Integer.parseInt(cmd.getOptionValue("chunk_seconds", "45")));
+
+        String outputContent = cmd.getOptionValue("output_content", "both").toLowerCase();
+        if (!outputContent.equals("vocals") && !outputContent.equals("both")) {
+            logger.warn("Invalid value for output_content: '{}'. Defaulting to 'both'.", outputContent);
+            outputContent = "both";
+        }
+        processingArgs.put("output_content", outputContent);
 
 
         AudioProcessor audioProcessor;
@@ -133,8 +141,15 @@ public class Main {
                     String noVocalsPath = Paths.get(outputDir, baseName + "_no_vocals.wav").toString();
 
                     AudioIOUtils.writeWavFile(vocalsPath, vocals, targetSampleRate);
-                    AudioIOUtils.writeWavFile(noVocalsPath, noVocals, targetSampleRate);
-                    logger.info("Successfully separated tracks for {}. Vocals: {}, No Vocals: {}", filePath, vocalsPath, noVocalsPath);
+                    logger.info("Vocals output saved to: {}", vocalsPath);
+
+                    if ("both".equals(processingArgs.get("output_content"))) {
+                        AudioIOUtils.writeWavFile(noVocalsPath, noVocals, targetSampleRate);
+                        logger.info("Accompaniment output saved to: {}", noVocalsPath);
+                    } else {
+                        logger.info("Accompaniment output skipped as per output_content setting.");
+                    }
+                    logger.info("Successfully separated tracks for {}.", filePath);
                 } else {
                     logger.error("Separation failed or returned incorrect number of tracks for file: {}", filePath);
                 }

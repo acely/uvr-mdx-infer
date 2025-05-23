@@ -26,6 +26,7 @@ public class AudioSeparator implements AutoCloseable {
     private final float sampleRate;
     private final int modelChunkSizeInSamples; // Renamed from chunkSizeInSamples for clarity
     private final String modelInputName;
+    private final String outputContent; // To store "vocals" or "both"
 
     private static final Logger logger = LoggerFactory.getLogger(AudioSeparator.class);
 
@@ -38,6 +39,7 @@ public class AudioSeparator implements AutoCloseable {
         this.marginSamples = ((Number) this.args.getOrDefault("margin", 1.0f * this.sampleRate)).intValue();
         this.chunkSeconds = ((Number) this.args.getOrDefault("chunks", 45)).intValue(); // Default to 45s, matching python GUI
         this.denoiseEnabled = (boolean) this.args.getOrDefault("denoise", false); // Default to false, matching python CLI
+        this.outputContent = (String) this.args.getOrDefault("output_content", "both");
 
         if (this.chunkSeconds <= 0) {
             this.modelChunkSizeInSamples = Integer.MAX_VALUE; // Indicates processing whole file as one chunk
@@ -109,27 +111,30 @@ public class AudioSeparator implements AutoCloseable {
             segmentedMix.put(skip, segment); // Key is the original start of the chunk *without* margin
         }
         
+        }
+        
         // processSegmentedMix now returns List<float[][][][]>
+        // Index 0: Vocals Spectrogram, Index 1: Accompaniment Spectrogram (or null)
         List<float[][][][]> fullSpectrograms = processSegmentedMix(segmentedMix, totalOriginalSamples, currentProcessingChunkSize);
         float[][][][] fullVocalsSpectrogram = fullSpectrograms.get(0);
-        float[][][][] fullAccompanimentSpectrogram = fullSpectrograms.get(1);
+        float[][][][] fullAccompanimentSpectrogram = fullSpectrograms.get(1); // This can be null
 
         logger.info("Performing ISTFT on full vocals spectrogram...");
         float[][] vocalsAudio = audioProcessor.istft(fullVocalsSpectrogram, totalOriginalSamples);
-        logger.info("Performing ISTFT on full accompaniment spectrogram...");
-        float[][] accompanimentAudio = audioProcessor.istft(fullAccompanimentSpectrogram, totalOriginalSamples);
         
-        // The task was to return vocals and *accompaniment*. 
-        // The original code calculated accompaniment as fullMixAudio - vocals.
-        // Now, accompaniment is directly synthesized from its own spectrogram.
-        // If the model is trained to output vocals and accompaniment directly, this is correct.
-        // If the model only outputs vocals, and accompaniment is derived, then the old logic for 'noVocals' would be needed *after* ISTFT of vocals.
-        // Assuming the model outputs a vocal component, and we derive accompaniment from it by subtraction from the mix in spectrogram domain,
-        // then ISTFTing both is the correct approach.
+        float[][] accompanimentAudio = null;
+        if ("both".equals(this.outputContent) && fullAccompanimentSpectrogram != null) {
+            logger.info("Performing ISTFT on full accompaniment spectrogram...");
+            accompanimentAudio = audioProcessor.istft(fullAccompanimentSpectrogram, totalOriginalSamples);
+        } else {
+            logger.info("Accompaniment processing skipped as per output_content setting or missing spectrogram.");
+            // Create empty/silent audio if not processing accompaniment, to maintain structure
+            accompanimentAudio = new float[numChannels][totalOriginalSamples]; 
+        }
 
         List<float[][]> result = new ArrayList<>();
         result.add(vocalsAudio);
-        result.add(accompanimentAudio); // Now using the ISTFT of the accompaniment spectrogram
+        result.add(accompanimentAudio);
         logger.info("Audio separation process completed.");
         return result;
     }
@@ -156,7 +161,10 @@ public class AudioSeparator implements AutoCloseable {
 
 
         float[][][][] fullVocalsSpectrogram = initializeSpectrogram(numChannels, numComplex, dim_f, totalTimeFrames);
-        float[][][][] fullAccompSpectrogram = initializeSpectrogram(numChannels, numComplex, dim_f, totalTimeFrames);
+        float[][][][] fullAccompSpectrogram = null; // Initialize to null
+        if ("both".equals(this.outputContent)) {
+            fullAccompSpectrogram = initializeSpectrogram(numChannels, numComplex, dim_f, totalTimeFrames);
+        }
         float[] sumSquareWindow = new float[totalTimeFrames]; // 1D for frame-wise normalization factor
 
         // Precompute a Hann window for overlap-add blending if marginSamples > 0
@@ -182,10 +190,10 @@ public class AudioSeparator implements AutoCloseable {
             logger.debug("Processing segment: originalAudioStartSample={}, originalAudioLength={}, audioSegmentWithMarginLength={}", 
                 segmentOriginalStartSample, originalLengthOfThisSegmentAudio, segmentAudioWithMargin[0].length);
 
-            // demixChunk now returns List<float[][][][]> (vocals_spec, accomp_spec) for segmentAudioWithMargin
+            // demixChunk now returns List<float[][][][]> (vocals_spec, accomp_spec or null)
             List<float[][][][]> segmentSpectrograms = demixChunk(segmentAudioWithMargin); 
             float[][][][] vocalsSegmentSpec = segmentSpectrograms.get(0); // [2][2][dim_f][segment_frames]
-            float[][][][] accompSegmentSpec = segmentSpectrograms.get(1); // [2][2][dim_f][segment_frames]
+            float[][][][] accompSegmentSpec = segmentSpectrograms.get(1); // This can be null if outputContent is "vocals"
             
             int segmentTotalFrames = vocalsSegmentSpec[0][0][0].length; // Number of time frames in the current segment's spectrogram
 
@@ -253,7 +261,9 @@ public class AudioSeparator implements AutoCloseable {
                     for (int cpl = 0; cpl < numComplex; ++cpl) {
                         for (int f = 0; f < dim_f; ++f) {
                             fullVocalsSpectrogram[ch][cpl][f][t_full] += vocalsSegmentSpec[ch][cpl][f][t_read] * windowVal;
-                            fullAccompSpectrogram[ch][cpl][f][t_full] += accompanimentSegmentSpec[ch][cpl][f][t_read] * windowVal;
+                            if (accompSegmentSpec != null && fullAccompSpectrogram != null) {
+                                fullAccompSpectrogram[ch][cpl][f][t_full] += accompSegmentSpec[ch][cpl][f][t_read] * windowVal;
+                            }
                         }
                     }
                 }
@@ -264,12 +274,14 @@ public class AudioSeparator implements AutoCloseable {
 
         // Normalize the overlap-added regions
         for (int t = 0; t < totalTimeFrames; ++t) {
-            if (sumSquareWindow[t] > 1e-8f) {
+            if (sumSquareWindow[t] > 1e-8f) { // Avoid division by zero or very small numbers
                 for (int ch = 0; ch < numChannels; ++ch) {
                     for (int cpl = 0; cpl < numComplex; ++cpl) {
                         for (int f = 0; f < dim_f; ++f) {
                             fullVocalsSpectrogram[ch][cpl][f][t] /= sumSquareWindow[t];
-                            fullAccompSpectrogram[ch][cpl][f][t] /= sumSquareWindow[t];
+                            if (fullAccompSpectrogram != null) {
+                                fullAccompSpectrogram[ch][cpl][f][t] /= sumSquareWindow[t];
+                            }
                         }
                     }
                 }
@@ -278,7 +290,7 @@ public class AudioSeparator implements AutoCloseable {
         
         List<float[][][][]> resultSpectrograms = new ArrayList<>();
         resultSpectrograms.add(fullVocalsSpectrogram);
-        resultSpectrograms.add(fullAccompSpectrogram);
+        resultSpectrograms.add(fullAccompSpectrogram); // This will be null if outputContent was "vocals"
         return resultSpectrograms;
     }
     
@@ -316,8 +328,7 @@ public class AudioSeparator implements AutoCloseable {
             currentSamplesInSegment, pythonGenSize, padForPythonGenSize, paddedInputLengthForLoop, stftModelProcessingChunkSize);
 
         List<float[][][][]> vocalSubChunkSpectrograms = new ArrayList<>();
-        List<float[][][][]> accompanimentSubChunkSpectrograms = new ArrayList<>();
-        int totalFramesProcessed = 0;
+        List<float[][][][]> accompanimentSubChunkSpectrograms = new ArrayList<>(); // Might remain empty
 
         for (int i = 0; i <= paddedInputLengthForLoop - stftModelProcessingChunkSize; i += pythonGenSize) {
             float[][] subChunkForStft = new float[2][stftModelProcessingChunkSize];
@@ -362,14 +373,16 @@ public class AudioSeparator implements AutoCloseable {
             // The stft method already returns this format.
             float[][][][] mixSubChunkSpec = spectrogram; // This is the STFT of the current subChunkForStft
 
-            float[][][][] accompanimentSubChunkSpec = subtractSpectrograms(mixSubChunkSpec, vocalSubChunkSpec);
-
             vocalSubChunkSpectrograms.add(vocalSubChunkSpec);
-            accompanimentSubChunkSpectrograms.add(accompanimentSubChunkSpec);
-            totalFramesProcessed += dim_t_model; // Each sub-chunk spec has dim_t_model frames
+
+            if ("both".equals(this.outputContent)) {
+                float[][][][] accompanimentSubChunkSpec = subtractSpectrograms(mixSubChunkSpec, vocalSubChunkSpec);
+                accompanimentSubChunkSpectrograms.add(accompanimentSubChunkSpec);
+            }
+            // totalFramesProcessed += dim_t_model; // Not strictly needed anymore
         }
         
-        logger.debug("Processed {} sub-chunks. Concatenating spectrograms.", vocalSubChunkSpectrograms.size());
+        logger.debug("Processed {} sub-chunks.", vocalSubChunkSpectrograms.size());
 
         // Concatenate sub-chunk spectrograms
         // The effective number of frames in each sub-chunk after ISTFT and trimming would be (pythonGenSize / hop_length)
@@ -401,17 +414,19 @@ public class AudioSeparator implements AutoCloseable {
         // Number of frames for stftInternalTrim: stftInternalTrim / hop_length
         int framesToTrimFromSubChunkSpec = stftInternalTrim / hop_length;
         List<float[][][][]> trimmedVocalSpecs = new ArrayList<>();
-        List<float[][][][]> trimmedAccompSpecs = new ArrayList<>();
-
         for(float[][][][] spec : vocalSubChunkSpectrograms) {
             trimmedVocalSpecs.add(trimSpectrogramFrames(spec, framesToTrimFromSubChunkSpec, framesToTrimFromSubChunkSpec));
         }
-        for(float[][][][] spec : accompanimentSubChunkSpectrograms) {
-            trimmedAccompSpecs.add(trimSpectrogramFrames(spec, framesToTrimFromSubChunkSpec, framesToTrimFromSubChunkSpec));
-        }
-
         float[][][][] fullVocalsSpectrogram = concatenateSpectrograms(trimmedVocalSpecs, dim_f_model);
-        float[][][][] fullAccompSpectrogram = concatenateSpectrograms(trimmedAccompSpecs, dim_f_model);
+        
+        float[][][][] fullAccompSpectrogram = null;
+        if ("both".equals(this.outputContent)) {
+            List<float[][][][]> trimmedAccompSpecs = new ArrayList<>();
+            for(float[][][][] spec : accompanimentSubChunkSpectrograms) {
+                trimmedAccompSpecs.add(trimSpectrogramFrames(spec, framesToTrimFromSubChunkSpec, framesToTrimFromSubChunkSpec));
+            }
+            fullAccompSpectrogram = concatenateSpectrograms(trimmedAccompSpecs, dim_f_model);
+        }
 
         // Final trim based on `padForPythonGenSize` (padding added to make original segment multiple of pythonGenSize)
         int totalFramesBeforeFinalTrim = fullVocalsSpectrogram[0][0][0].length;
@@ -423,13 +438,16 @@ public class AudioSeparator implements AutoCloseable {
 
 
         fullVocalsSpectrogram = trimSpectrogramFrames(fullVocalsSpectrogram, 0, totalFramesBeforeFinalTrim - targetTotalFrames);
-        fullAccompSpectrogram = trimSpectrogramFrames(fullAccompSpectrogram, 0, totalFramesBeforeFinalTrim - targetTotalFrames);
+        if (fullAccompSpectrogram != null) {
+            fullAccompSpectrogram = trimSpectrogramFrames(fullAccompSpectrogram, 0, totalFramesBeforeFinalTrim - targetTotalFrames);
+        }
         
-        logger.debug("Demixing chunk finished. Spectrograms ready. Target frames: {}, Actual frames: {}", targetTotalFrames, fullVocalsSpectrogram[0][0][0].length);
+        logger.debug("Demixing chunk finished. Spectrograms ready. Target frames: {}, Actual frames: {}", 
+                     targetTotalFrames, fullVocalsSpectrogram[0][0][0].length);
         
         List<float[][][][]> resultSpectrograms = new ArrayList<>();
         resultSpectrograms.add(fullVocalsSpectrogram);
-        resultSpectrograms.add(fullAccompSpectrogram);
+        resultSpectrograms.add(fullAccompSpectrogram); // Will be null if not "both"
         return resultSpectrograms;
     }
 
