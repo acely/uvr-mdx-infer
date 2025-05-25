@@ -19,6 +19,8 @@ import java.awt.datatransfer.UnsupportedFlavorException;
 import java.awt.Point; // For drop location
 import java.awt.Rectangle; // For component bounds
 import java.awt.Component; // For getComponent and instanceof checks
+import java.util.function.Supplier; // For index supplier
+import java.util.concurrent.atomic.AtomicReference; // For index supplier
 
 //Other necessary imports
 import java.io.File;
@@ -131,8 +133,8 @@ public class SeparationAppGui extends JFrame {
                     return false;
                 }
 
-                // First, check for TaskPanel flavor, as it's simpler and doesn't involve file lists
-                if (support.isDataFlavorSupported(TaskPanel.TASK_PANEL_FLAVOR)) {
+                // First, check for TaskPanel index flavor
+                if (support.isDataFlavorSupported(TaskPanel.TASK_PANEL_INDEX_FLAVOR)) {
                     return true;
                 }
 
@@ -195,25 +197,22 @@ public class SeparationAppGui extends JFrame {
             }
             Transferable transferable = support.getTransferable();
             try {
-                if (support.isDataFlavorSupported(TaskPanel.TASK_PANEL_FLAVOR)) {
-                    TaskPanel draggedPanel = (TaskPanel) transferable.getTransferData(TaskPanel.TASK_PANEL_FLAVOR);
+                if (support.isDataFlavorSupported(TaskPanel.TASK_PANEL_INDEX_FLAVOR)) {
+                    int draggedPanelOldIndex = (Integer) transferable.getTransferData(TaskPanel.TASK_PANEL_INDEX_FLAVOR);
                     
-                    if (draggedPanel == null) { 
-                        logger.error("draggedPanel is null after getting transfer data for TASK_PANEL_FLAVOR.");
+                    TaskPanel draggedPanel;
+                    try {
+                        draggedPanel = taskPanelsList.get(draggedPanelOldIndex);
+                    } catch (IndexOutOfBoundsException e) {
+                        logger.error("Invalid index {} received for dragged TaskPanel. List size: {}.", draggedPanelOldIndex, taskPanelsList.size(), e);
                         return false;
                     }
                     
-                    Point dropPoint = support.getDropLocation().getDropPoint();
+                    // Remove the panel using its old index before calculating new position
+                    taskPanelsList.remove(draggedPanelOldIndex);
+                    // tasksContainerPanel.remove(draggedPanel); // This will be handled by removeAll and re-add
 
-                    int oldLogicalIndex = taskPanelsList.indexOf(draggedPanel);
-                    if (oldLogicalIndex != -1) {
-                         taskPanelsList.remove(oldLogicalIndex);
-                    } else {
-                        logger.warn("Dragged TaskPanel not found in taskPanelsList for reordering. Panel File: {}", 
-                                   (draggedPanel.getAudioFile() != null ? draggedPanel.getFilePath() : "Unknown path"));
-                        tasksContainerPanel.remove(draggedPanel); 
-                    }
-                    
+                    Point dropPoint = support.getDropLocation().getDropPoint();
                     int newLogicalIndex = 0;
                     for (int i = 0; i < tasksContainerPanel.getComponentCount(); i++) {
                         Component comp = tasksContainerPanel.getComponent(i);
@@ -252,7 +251,12 @@ public class SeparationAppGui extends JFrame {
                     for (File file : files) {
                         String name = file.getName().toLowerCase();
                         if (file.isFile() && (name.endsWith(".wav") || name.endsWith(".mp3") || name.endsWith(".flac"))) {
-                            TaskPanel taskPanel = new TaskPanel(file); 
+                            AtomicReference<TaskPanel> panelRef = new AtomicReference<>();
+                            Supplier<Integer> indexSupplier = () -> taskPanelsList.indexOf(panelRef.get());
+
+                            TaskPanel taskPanel = new TaskPanel(file, indexSupplier);
+                            panelRef.set(taskPanel); // Set ref after TaskPanel created
+                            
                             final String filePath = file.getAbsolutePath(); 
                             taskPanel.getRemoveButton().addActionListener(evt -> {
                                 tasksContainerPanel.remove(taskPanel); 
@@ -262,7 +266,7 @@ public class SeparationAppGui extends JFrame {
                                 logger.info("TaskPanel removed: {}. Remaining tasks: {}", filePath, taskPanelsList.size());
                             });
                             tasksContainerPanel.add(taskPanel);
-                            taskPanelsList.add(taskPanel);
+                            taskPanelsList.add(taskPanel); // Add to list
                             filesAddedCount++;
                         }
                     }
@@ -307,18 +311,24 @@ public class SeparationAppGui extends JFrame {
         if (returnValue == JFileChooser.APPROVE_OPTION) {
             File[] selectedFiles = fileChooser.getSelectedFiles();
             for (File file : selectedFiles) {
-                TaskPanel taskPanel = new TaskPanel(file);
+                AtomicReference<TaskPanel> panelRef = new AtomicReference<>();
+                Supplier<Integer> indexSupplier = () -> taskPanelsList.indexOf(panelRef.get());
+                
+                TaskPanel taskPanel = new TaskPanel(file, indexSupplier);
+                panelRef.set(taskPanel); // Set the reference after TaskPanel is created
+
                 taskPanel.getRemoveButton().addActionListener(new ActionListener() {
                     @Override
                     public void actionPerformed(ActionEvent evt) {
                         tasksContainerPanel.remove(taskPanel);
-                        taskPanelsList.remove(taskPanel); // Also remove from our tracking list
+                        taskPanelsList.remove(taskPanel); 
                         tasksContainerPanel.revalidate();
                         tasksContainerPanel.repaint();
+                        logger.info("TaskPanel removed: {}. Remaining tasks: {}", taskPanel.getFilePath(), taskPanelsList.size());
                     }
                 });
                 tasksContainerPanel.add(taskPanel);
-                taskPanelsList.add(taskPanel); // Add to our tracking list
+                taskPanelsList.add(taskPanel); 
             }
             tasksContainerPanel.revalidate();
             tasksContainerPanel.repaint();

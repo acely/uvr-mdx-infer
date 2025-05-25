@@ -15,6 +15,7 @@ import java.awt.Image; // For drag image
 import java.awt.image.BufferedImage; // For drag image
 import java.awt.Graphics2D; // For drag image
 import java.awt.Dimension; // For drag image
+import java.util.function.Supplier; // For index supplier
 // For instanceof checks:
 import javax.swing.JButton;
 import javax.swing.JProgressBar;
@@ -23,18 +24,21 @@ import java.awt.Component;
 
 public class TaskPanel extends JPanel {
 
-    public static final DataFlavor TASK_PANEL_FLAVOR = new DataFlavor(TaskPanel.class, "TaskPanel");
+    // public static final DataFlavor TASK_PANEL_FLAVOR = new DataFlavor(TaskPanel.class, "TaskPanel");
+    public static final DataFlavor TASK_PANEL_INDEX_FLAVOR = new DataFlavor(Integer.class, "application/x-taskpanel-index");
 
     private File audioFile;
     private JLabel fileNameLabel;
     JProgressBar progressBar; 
     private JButton removeButton;
+    private Supplier<Integer> indexSupplier;
 
-    public TaskPanel(File audioFile) {
+    public TaskPanel(File audioFile, Supplier<Integer> indexSupplier) {
         if (audioFile == null) {
             throw new IllegalArgumentException("audioFile cannot be null");
         }
         this.audioFile = audioFile;
+        this.indexSupplier = indexSupplier;
 
         fileNameLabel = new JLabel(audioFile.getName());
         fileNameLabel.setPreferredSize(new Dimension(250, 30)); 
@@ -79,20 +83,20 @@ public class TaskPanel extends JPanel {
 
     // Inner class for Transferable
     private static class TaskPanelTransferable implements Transferable {
-        private TaskPanel panel;
+        private int panelIndex;
 
-        public TaskPanelTransferable(TaskPanel panel) {
-            this.panel = panel;
+        public TaskPanelTransferable(int panelIndex) {
+            this.panelIndex = panelIndex;
         }
 
         @Override
         public DataFlavor[] getTransferDataFlavors() {
-            return new DataFlavor[] { TASK_PANEL_FLAVOR };
+            return new DataFlavor[] { TASK_PANEL_INDEX_FLAVOR };
         }
 
         @Override
         public boolean isDataFlavorSupported(DataFlavor flavor) {
-            return TASK_PANEL_FLAVOR.equals(flavor);
+            return TASK_PANEL_INDEX_FLAVOR.equals(flavor);
         }
 
         @Override
@@ -100,7 +104,7 @@ public class TaskPanel extends JPanel {
             if (!isDataFlavorSupported(flavor)) {
                 throw new UnsupportedFlavorException(flavor);
             }
-            return panel;
+            return this.panelIndex; // Return the Integer index
         }
     }
 
@@ -114,21 +118,17 @@ public class TaskPanel extends JPanel {
         @Override
         protected Transferable createTransferable(JComponent c) {
             TaskPanel panel = (TaskPanel) c;
+            int index = panel.indexSupplier.get(); // Get the index from the supplier
+
+            // Drag image creation logic (remains the same, using 'panel' to paint)
             Dimension size = panel.getSize();
-            // Ensure size is valid before creating BufferedImage
-            if (size.width <= 0 || size.height <= 0) {
-                // Fallback or log error if size is invalid, though typically components should have valid sizes.
-                // For now, just create a minimal image or skip drag image if size is problematic.
-                // This might happen if the component is not yet fully laid out.
-                // However, by the time mousePressed occurs, it should be.
-                // Let's assume valid size for now.
-            }
             BufferedImage dragImage = new BufferedImage(size.width, size.height, BufferedImage.TYPE_INT_ARGB);
             Graphics2D g2 = dragImage.createGraphics();
-            panel.paint(g2); // Paint the component onto the image
+            panel.paint(g2);
             g2.dispose();
-            setDragImage(dragImage); // Set the drag image
-            return new TaskPanelTransferable(panel);
+            setDragImage(dragImage); // Set the drag image on the handler
+
+            return new TaskPanelTransferable(index); // Transfer the index
         }
 
         @Override
