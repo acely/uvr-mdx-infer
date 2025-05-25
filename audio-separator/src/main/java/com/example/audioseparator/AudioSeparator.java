@@ -166,7 +166,7 @@ public class AudioSeparator implements AutoCloseable {
         if ("both".equals(this.outputContent)) {
             fullAccompSpectrogram = initializeSpectrogram(numChannels, numComplex, dim_f, totalTimeFrames);
         }
-        float[] sumSquareWindow = new float[totalTimeFrames]; // 1D for frame-wise normalization factor
+        // float[] sumSquareWindow = new float[totalTimeFrames]; // REMOVED for no normalization
 
         // Precompute a Hann window for overlap-add blending if marginSamples > 0
         // The window length should cover the margin on one side.
