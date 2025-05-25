@@ -125,33 +125,67 @@ public class SeparationAppGui extends JFrame {
 
     // Inner class for handling file drops
     private class FileDropHandler extends TransferHandler {
-        @Override
-        public boolean canImport(TransferHandler.TransferSupport support) {
-            if (support.isDataFlavorSupported(TaskPanel.TASK_PANEL_FLAVOR)) {
-                return true;
-            }
-            if (support.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
-                try {
-                    if (!support.getTransferable().isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
-                         return false;
-                    }
-                    java.util.List<File> files = (java.util.List<File>) support.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
-                    if (files.isEmpty()) return false;
-                    for (File file : files) {
-                        if (file.isDirectory()) continue; 
-                        String name = file.getName().toLowerCase();
-                        if (name.endsWith(".wav") || name.endsWith(".mp3") || name.endsWith(".flac")) {
-                            return true; 
-                        }
-                    }
-                    return false; 
-                } catch (UnsupportedFlavorException | IOException e) {
-                    logger.warn("Exception during canImport file check: {}", e.getMessage());
+            @Override
+            public boolean canImport(TransferHandler.TransferSupport support) {
+                if (support == null) { // Basic check for support itself
                     return false;
                 }
+
+                // First, check for TaskPanel flavor, as it's simpler and doesn't involve file lists
+                if (support.isDataFlavorSupported(TaskPanel.TASK_PANEL_FLAVOR)) {
+                    return true;
+                }
+
+                // Now, handle javaFileListFlavor with robust checks
+                if (support.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                    Transferable transferable = support.getTransferable();
+                    if (transferable == null) {
+                        logger.warn("Transferable is null during canImport for javaFileListFlavor.");
+                        return false;
+                    }
+
+                    // It's important to also check if the transferable *actually* supports the flavor
+                    // before trying to get data from it, to avoid potential exceptions with some L&F or OS.
+                    if (!transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                        // This case implies that isDataFlavorSupported on 'support' was true,
+                        // but on 'transferable' it's false. This can happen.
+                        return false;
+                    }
+
+                    try {
+                        java.util.List<File> files = (java.util.List<File>) transferable.getTransferData(DataFlavor.javaFileListFlavor);
+
+                        if (files == null || files.isEmpty()) {
+                            // Log if files is null, as it's somewhat unexpected if flavor was supported
+                            if (files == null) {
+                                logger.warn("getTransferData for javaFileListFlavor returned null.");
+                            }
+                            return false;
+                        }
+
+                        for (File file : files) {
+                            if (file == null) { // Check for null files in the list
+                                logger.warn("Null file found in file list during canImport.");
+                                continue; // Skip this null file
+                            }
+                            if (file.isDirectory()) {
+                                continue; // We are interested in files, not directories
+                            }
+                            String name = file.getName().toLowerCase();
+                            if (name.endsWith(".wav") || name.endsWith(".mp3") || name.endsWith(".flac")) {
+                                return true; // Found at least one valid audio file
+                            }
+                        }
+                        // No valid audio files found in the list
+                        return false;
+                    } catch (UnsupportedFlavorException | IOException e) {
+                        logger.warn("Exception during canImport file check: {}", e.getMessage(), e);
+                        return false;
+                    }
+                }
+                // Neither TaskPanel nor a valid FileList flavor is supported
+                return false;
             }
-            return false; 
-        }
 
         @Override
         @SuppressWarnings("unchecked")
