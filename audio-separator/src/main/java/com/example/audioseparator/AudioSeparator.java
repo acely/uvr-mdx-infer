@@ -111,8 +111,6 @@ public class AudioSeparator implements AutoCloseable {
             segmentedMix.put(skip, segment); // Key is the original start of the chunk *without* margin
         }
         
-        }
-        
         // processSegmentedMix now returns List<float[][][][]>
         // Index 0: Vocals Spectrogram, Index 1: Accompaniment Spectrogram (or null)
         List<float[][][][]> fullSpectrograms = processSegmentedMix(segmentedMix, totalOriginalSamples, currentProcessingChunkSize, listener);
@@ -272,28 +270,16 @@ public class AudioSeparator implements AutoCloseable {
                         }
                     }
                 }
-                sumSquareWindow[t_full] += windowVal * windowVal;
+                // sumSquareWindow[t_full] += windowVal * windowVal; // Normalization removed/simplified
             }
             // System.out.println("Segment " + currentSegmentNum + " processed (spectrogram domain).");
             // Optional: listener.progressPublish("Segment " + currentSegmentNum + " processed."); 
             // The progressChanged for the *next* segment might be sufficient.
         }
 
-        // Normalize the overlap-added regions
-        for (int t = 0; t < totalTimeFrames; ++t) {
-            if (sumSquareWindow[t] > 1e-8f) { // Avoid division by zero or very small numbers
-                for (int ch = 0; ch < numChannels; ++ch) {
-                    for (int cpl = 0; cpl < numComplex; ++cpl) {
-                        for (int f = 0; f < dim_f; ++f) {
-                            fullVocalsSpectrogram[ch][cpl][f][t] /= sumSquareWindow[t];
-                            if (fullAccompSpectrogram != null) {
-                                fullAccompSpectrogram[ch][cpl][f][t] /= sumSquareWindow[t];
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Normalization based on sumSquareWindow was removed as per simplified Python version.
+        // If normalization is desired, it should be carefully re-implemented.
+        // For now, direct summation (or averaging if windowVal is adjusted) is performed.
         
         List<float[][][][]> resultSpectrograms = new ArrayList<>();
         resultSpectrograms.add(fullVocalsSpectrogram);
@@ -640,13 +626,13 @@ public class AudioSeparator implements AutoCloseable {
             } catch (OrtException e) {
                 logger.error("Error closing OrtSession", e);
             }
-            this.session = null;
+            // this.session = null; // session is final
         }
         if (this.env != null) {
             // OrtEnvironment is a singleton and typically closed when the application shuts down.
             // Closing it here might affect other users of the ONNX runtime in the same JVM.
             // this.env.close(); // Consider if this is truly instance-specific or application-wide
-            this.env = null; 
+            // this.env = null; // env is final
         }
     }
 }

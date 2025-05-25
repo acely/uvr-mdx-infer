@@ -31,7 +31,7 @@ public class AudioProcessor {
         }
     }
 
-    private float[] computeHannWindow(int length) {
+    public float[] computeHannWindow(int length) {
         float[] window = new float[length];
         for (int i = 0; i < length; i++) {
             window[i] = (float) (0.5 * (1 - Math.cos(2 * Math.PI * i / (length - 1))));

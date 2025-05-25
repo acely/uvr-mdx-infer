@@ -1,20 +1,37 @@
 package com.example.audioseparator;
 
+//Keep existing SLF4J imports
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+//Standard Java Swing and AWT imports
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+
+//Imports for Drag and Drop functionality
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.Transferable;
+import java.awt.datatransfer.UnsupportedFlavorException;
+import java.awt.Point; // For drop location
+import java.awt.Rectangle; // For component bounds
+import java.awt.Component; // For getComponent and instanceof checks
+
+//Other necessary imports
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+
+// TaskPanel is in the same package, so direct import like below is optional
+// but can be good for clarity when accessing static members like TASK_PANEL_FLAVOR.
+// import com.example.audioseparator.TaskPanel; 
 
 public class SeparationAppGui extends JFrame {
     private static final Logger logger = LoggerFactory.getLogger(SeparationAppGui.class);
@@ -87,6 +104,9 @@ public class SeparationAppGui extends JFrame {
         addFilesButton.addActionListener(e -> addFiles());
         startProcessingButton.addActionListener(e -> startProcessing());
 
+        // Set up drag and drop
+        tasksContainerPanel.setTransferHandler(new FileDropHandler());
+
         // Window closing listener
         addWindowListener(new WindowAdapter() {
             @Override
@@ -101,6 +121,129 @@ public class SeparationAppGui extends JFrame {
                 }
             }
         });
+    }
+
+    // Inner class for handling file drops
+    private class FileDropHandler extends TransferHandler {
+        @Override
+        public boolean canImport(TransferHandler.TransferSupport support) {
+            if (support.isDataFlavorSupported(TaskPanel.TASK_PANEL_FLAVOR)) {
+                return true;
+            }
+            if (support.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                try {
+                    if (!support.getTransferable().isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                         return false;
+                    }
+                    java.util.List<File> files = (java.util.List<File>) support.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
+                    if (files.isEmpty()) return false;
+                    for (File file : files) {
+                        if (file.isDirectory()) continue; 
+                        String name = file.getName().toLowerCase();
+                        if (name.endsWith(".wav") || name.endsWith(".mp3") || name.endsWith(".flac")) {
+                            return true; 
+                        }
+                    }
+                    return false; 
+                } catch (UnsupportedFlavorException | IOException e) {
+                    logger.warn("Exception during canImport file check: {}", e.getMessage());
+                    return false;
+                }
+            }
+            return false; 
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public boolean importData(TransferHandler.TransferSupport support) {
+            if (!canImport(support)) {
+                return false;
+            }
+            Transferable transferable = support.getTransferable();
+            try {
+                if (support.isDataFlavorSupported(TaskPanel.TASK_PANEL_FLAVOR)) {
+                    TaskPanel draggedPanel = (TaskPanel) transferable.getTransferData(TaskPanel.TASK_PANEL_FLAVOR);
+                    
+                    if (draggedPanel == null) { 
+                        logger.error("draggedPanel is null after getting transfer data for TASK_PANEL_FLAVOR.");
+                        return false;
+                    }
+                    
+                    Point dropPoint = support.getDropLocation().getDropPoint();
+
+                    int oldLogicalIndex = taskPanelsList.indexOf(draggedPanel);
+                    if (oldLogicalIndex != -1) {
+                         taskPanelsList.remove(oldLogicalIndex);
+                    } else {
+                        logger.warn("Dragged TaskPanel not found in taskPanelsList for reordering. Panel File: {}", 
+                                   (draggedPanel.getAudioFile() != null ? draggedPanel.getFilePath() : "Unknown path"));
+                        tasksContainerPanel.remove(draggedPanel); 
+                    }
+                    
+                    int newLogicalIndex = 0;
+                    for (int i = 0; i < tasksContainerPanel.getComponentCount(); i++) {
+                        Component comp = tasksContainerPanel.getComponent(i);
+                        if (comp == draggedPanel) continue; 
+
+                        Rectangle bounds = comp.getBounds();
+                        if (dropPoint.y >= bounds.y && dropPoint.y <= bounds.y + bounds.height) { 
+                            if (dropPoint.x < bounds.x + bounds.width / 2) { 
+                                break; 
+                            } else {
+                                newLogicalIndex++; 
+                            }
+                        } else if (dropPoint.y < bounds.y) { 
+                            break; 
+                        } else { 
+                            newLogicalIndex++; 
+                        }
+                    }
+                    newLogicalIndex = Math.max(0, Math.min(newLogicalIndex, taskPanelsList.size()));
+
+                    taskPanelsList.add(newLogicalIndex, draggedPanel);
+
+                    tasksContainerPanel.removeAll();
+                    for (TaskPanel tp : taskPanelsList) {
+                        tasksContainerPanel.add(tp);
+                    }
+
+                    tasksContainerPanel.revalidate();
+                    tasksContainerPanel.repaint();
+                    logger.info("TaskPanel reordered. New list size: {}. Reordered Panel: {}", taskPanelsList.size(), draggedPanel.getFilePath());
+                    return true;
+
+                } else if (support.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                    java.util.List<File> files = (java.util.List<File>) transferable.getTransferData(DataFlavor.javaFileListFlavor);
+                    int filesAddedCount = 0;
+                    for (File file : files) {
+                        String name = file.getName().toLowerCase();
+                        if (file.isFile() && (name.endsWith(".wav") || name.endsWith(".mp3") || name.endsWith(".flac"))) {
+                            TaskPanel taskPanel = new TaskPanel(file); 
+                            final String filePath = file.getAbsolutePath(); 
+                            taskPanel.getRemoveButton().addActionListener(evt -> {
+                                tasksContainerPanel.remove(taskPanel); 
+                                taskPanelsList.remove(taskPanel);
+                                tasksContainerPanel.revalidate();
+                                tasksContainerPanel.repaint();
+                                logger.info("TaskPanel removed: {}. Remaining tasks: {}", filePath, taskPanelsList.size());
+                            });
+                            tasksContainerPanel.add(taskPanel);
+                            taskPanelsList.add(taskPanel);
+                            filesAddedCount++;
+                        }
+                    }
+                    if (filesAddedCount > 0) {
+                        tasksContainerPanel.revalidate();
+                        tasksContainerPanel.repaint();
+                        logger.info("{} audio file(s) dropped and added. Total tasks: {}", filesAddedCount, taskPanelsList.size());
+                    }
+                    return filesAddedCount > 0;
+                }
+            } catch (UnsupportedFlavorException | IOException e) {
+                logger.error("Error during importData in FileDropHandler: {}", e.getMessage(), e);
+            }
+            return false;
+        }
     }
 
     private void browseForModel() {

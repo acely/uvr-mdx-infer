@@ -124,7 +124,7 @@ public class Main {
 
                 List<float[][]> separatedTracks;
                 try (AudioSeparator separator = new AudioSeparator(processingArgs, audioProcessor)) {
-                    separatedTracks = separator.separate(audioData);
+                    separatedTracks = separator.separate(audioData, null); // Added null for ProgressListener
                 } // AudioSeparator.close() called automatically
 
                 if (separatedTracks != null && separatedTracks.size() == 2) {
