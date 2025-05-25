@@ -12,6 +12,29 @@ public class MainSv {
 
     private static final Logger logger = LoggerFactory.getLogger(MainSv.class);
 
+    // Static nested class for ProgressListener implementation
+    private static class ConsoleProgressListener implements ProgressListener {
+        @Override
+        public void progressChanged(int current, int total) {
+            System.out.println("Progress: " + current + "/" + total);
+        }
+
+        @Override
+        public void progressPublish(String info) {
+            System.out.println("Info: " + info);
+        }
+
+        @Override
+        public void progressDone() {
+            System.out.println("Processing done.");
+        }
+
+        @Override
+        public void progressError() {
+            System.err.println("Processing error occurred.");
+        }
+    }
+
     public static void main(String[] args) {
         if (args.length < 3) {
             System.err.println("Usage: java -cp <classpath> com.example.audioseparator.MainSv <modelPath> <inputFilePath> <outputVocalsFilePath> [outputAccompanimentFilePath]");
@@ -56,6 +79,7 @@ public class MainSv {
         logger.info("Input File: {}", inputFilePath);
         logger.info("Output Vocals File: {}", outputVocalsFilePath);
 
+        ProgressListener consoleListener = new ConsoleProgressListener();
 
         try (AudioSeparationService service = new AudioSeparationService(modelPath, processingParams)) {
             // If output_content was set to "vocals", outputAccompanimentFilePath can be null or ignored by demixFile
@@ -75,7 +99,7 @@ public class MainSv {
             }
 
 
-            service.demixFile(inputFilePath, outputVocalsFilePath, effectiveAccompanimentPath);
+            service.demixFile(inputFilePath, outputVocalsFilePath, effectiveAccompanimentPath, consoleListener);
             
             logger.info("MainSv: Processing complete for {}. Vocals: {}", inputFilePath, outputVocalsFilePath);
             if (effectiveAccompanimentPath != null && "both".equals(processingParams.get("output_content"))) {

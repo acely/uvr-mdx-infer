@@ -68,9 +68,10 @@ public class AudioSeparationService implements AutoCloseable {
      * @param inputFilePath             Path to the input audio file.
      * @param outputVocalsFilePath      Path to save the vocals track.
      * @param outputAccompanimentFilePath Path to save the accompaniment track.
+     * @param listener ProgressListener to report progress and errors (can be null).
      * @throws Exception If any step of the demixing process fails.
      */
-    public void demixFile(String inputFilePath, String outputVocalsFilePath, String outputAccompanimentFilePath) throws Exception {
+    public void demixFile(String inputFilePath, String outputVocalsFilePath, String outputAccompanimentFilePath, ProgressListener listener) throws Exception {
         logger.info("Starting demixing process for file: {}", inputFilePath);
 
         float[][] audioData;
@@ -82,18 +83,20 @@ public class AudioSeparationService implements AutoCloseable {
             logger.info("Successfully read and resampled input file: {}", inputFilePath);
         } catch (Exception e) {
             logger.error("Failed to read input audio file: {}", inputFilePath, e);
+            if (listener != null) listener.progressError();
             throw new Exception("Failed to read input audio file: " + inputFilePath, e);
         }
 
         List<float[][]> separatedTracks;
         try {
-            separatedTracks = audioSeparator.separate(audioData);
+            separatedTracks = audioSeparator.separate(audioData, listener); // Pass listener
             if (separatedTracks == null || separatedTracks.size() < 2) {
                  throw new Exception("Audio separation did not return the expected number of tracks.");
             }
             logger.info("Audio separation successful for: {}", inputFilePath);
         } catch (Exception e) {
             logger.error("Error during audio separation for file: {}", inputFilePath, e);
+            if (listener != null) listener.progressError();
             throw new Exception("Error during audio separation for file: " + inputFilePath, e);
         }
 
@@ -105,6 +108,7 @@ public class AudioSeparationService implements AutoCloseable {
             logger.info("Vocals track saved to: {}", outputVocalsFilePath);
         } catch (Exception e) {
             logger.error("Failed to write vocals audio file: {}", outputVocalsFilePath, e);
+            if (listener != null) listener.progressError();
             throw new Exception("Failed to write vocals audio file: " + outputVocalsFilePath, e);
         }
 
@@ -117,6 +121,7 @@ public class AudioSeparationService implements AutoCloseable {
                     logger.info("Accompaniment track saved to: {}", outputAccompanimentFilePath);
                 } catch (Exception e) {
                     logger.error("Failed to write accompaniment audio file: {}", outputAccompanimentFilePath, e);
+                    if (listener != null) listener.progressError();
                     throw new Exception("Failed to write accompaniment audio file: " + outputAccompanimentFilePath, e);
                 }
             } else {

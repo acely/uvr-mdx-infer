@@ -79,7 +79,7 @@ public class AudioSeparator implements AutoCloseable {
         }
     }
 
-    public List<float[][]> separate(float[][] fullMixAudio) {
+    public List<float[][]> separate(float[][] fullMixAudio, ProgressListener listener) {
         logger.info("Starting audio separation process for audio of length: {} samples.", fullMixAudio[0].length);
         int totalOriginalSamples = fullMixAudio[0].length;
         int numChannels = fullMixAudio.length;
@@ -115,7 +115,7 @@ public class AudioSeparator implements AutoCloseable {
         
         // processSegmentedMix now returns List<float[][][][]>
         // Index 0: Vocals Spectrogram, Index 1: Accompaniment Spectrogram (or null)
-        List<float[][][][]> fullSpectrograms = processSegmentedMix(segmentedMix, totalOriginalSamples, currentProcessingChunkSize);
+        List<float[][][][]> fullSpectrograms = processSegmentedMix(segmentedMix, totalOriginalSamples, currentProcessingChunkSize, listener);
         float[][][][] fullVocalsSpectrogram = fullSpectrograms.get(0);
         float[][][][] fullAccompanimentSpectrogram = fullSpectrograms.get(1); // This can be null
 
@@ -136,10 +136,11 @@ public class AudioSeparator implements AutoCloseable {
         result.add(vocalsAudio);
         result.add(accompanimentAudio);
         logger.info("Audio separation process completed.");
+        if (listener != null) listener.progressDone();
         return result;
     }
 
-    private List<float[][][][]> processSegmentedMix(Map<Long, float[][]> segmentedMix, int totalOriginalSamples, int processingChunkSize) {
+    private List<float[][][][]> processSegmentedMix(Map<Long, float[][]> segmentedMix, int totalOriginalSamples, int processingChunkSize, ProgressListener listener) {
         logger.debug("Processing {} audio segments in spectrogram domain.", segmentedMix.size());
 
         final int n_fft = audioProcessor.getN_fft();
@@ -179,7 +180,11 @@ public class AudioSeparator implements AutoCloseable {
 
         for (Map.Entry<Long, float[][]> entry : segmentedMix.entrySet()) {
             currentSegmentNum++;
-            System.out.println("Processing segment " + currentSegmentNum + " of " + segmentCount + " (spectrogram domain)...");
+            // System.out.println("Processing segment " + currentSegmentNum + " of " + segmentCount + " (spectrogram domain)...");
+            if (listener != null) {
+                listener.progressPublish("Processing audio segment " + currentSegmentNum + " of " + segmentCount + "...");
+                listener.progressChanged(currentSegmentNum, segmentCount);
+            }
 
             long segmentOriginalStartSample = entry.getKey(); // Original start in samples, without left margin
             float[][] segmentAudioWithMargin = entry.getValue(); // Audio data *including* margins
@@ -269,7 +274,9 @@ public class AudioSeparator implements AutoCloseable {
                 }
                 sumSquareWindow[t_full] += windowVal * windowVal;
             }
-             System.out.println("Segment " + currentSegmentNum + " processed (spectrogram domain).");
+            // System.out.println("Segment " + currentSegmentNum + " processed (spectrogram domain).");
+            // Optional: listener.progressPublish("Segment " + currentSegmentNum + " processed."); 
+            // The progressChanged for the *next* segment might be sufficient.
         }
 
         // Normalize the overlap-added regions
@@ -295,7 +302,8 @@ public class AudioSeparator implements AutoCloseable {
     }
     
     // Returns a list containing two spectrograms: 0 = vocals, 1 = accompaniment
-    private List<float[][][][]> demixChunk(float[][] segmentWithMargin) { // Signature already changed
+    private List<float[][][][]> demixChunk(float[][] segmentWithMargin) { 
+        // Consider passing listener here if finer-grained progress for sub-chunks is needed
         final int n_fft = audioProcessor.getN_fft();
         final int hop_length = audioProcessor.getHop_length();
         final int dim_t_model = audioProcessor.getDim_t();
